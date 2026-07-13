@@ -45,405 +45,124 @@ func GetMangaInfo(mangaURL string) (data.MangaInfo, error) {
 
 	origTitle := chaptersPage.Find(".original-name").Text()
 
-	if origTitle == "" && chaptersPage.Find(".eng-name").Text() != "" {
+	if origTitle == "" {
 		origTitle = chaptersPage.Find(".eng-name").Text()
 	}
 
-	if origTitle == "" {
-		origTitle = chaptersPage.Find(".name").Text()
-	}
+	mangaInfo.Title = chaptersPage.Find(".name").Text()
+	mangaInfo.OrigTitle = origTitle
+	mangaInfo.ImgURL, _ = chaptersPage.Find(".picture-flex-img img").Attr("src")
 
-	mangaInfo.TitleOrig = origTitle
-	mangaInfo.TitleRu = chaptersPage.Find(".name").Text()
+	chaptersPage.Find(".chapters-link a").Each(func(i int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		if href != "" {
+			chapter := data.ChaptersList{
+				Title: strings.TrimSpace(s.Text()),
+				URL:   href,
+			}
+			mangaInfo.Chapters = append(mangaInfo.Chapters, chapter)
+		}
+	})
 
 	return mangaInfo, nil
 }
 
-func GetChaptersList(mangaURL string) ([]data.ChaptersList, []data.RMTranslators, bool, string, error) {
-	var err error
-	var chaptersList []data.ChaptersList
-	var transList []data.RMTranslators
-	var userHash string
-
-	isMtr := false
-
-	pageBody, err := tools.GetPageCF(mangaURL)
-	if err != nil {
-		return chaptersList, transList, isMtr, "", err
-	}
-
-	var buf bytes.Buffer
-	tee := io.TeeReader(pageBody, &buf)
-
-	chaptersPage, err := goquery.NewDocumentFromReader(tee)
-	if err != nil {
-		return chaptersList, transList, isMtr, "", err
-	}
-
-	if chaptersPage.Find(".mtr-message").Length() > 0 {
-		isMtr = true
-	}
-
-	chaptersPage.Find(".chapters a.chapter-link").Each(func(i int, s *goquery.Selection) {
-		href, _ := s.Attr("href")
-		path := strings.Split(strings.Trim(href, "/"), "/")
-
-		chapter := data.ChaptersList{
-			Title: strings.Trim(s.Text(), "\n "),
-			Path:  path[1] + "/" + strings.Split(path[2], "?")[0],
-		}
-
-		chaptersList = append(chaptersList, chapter)
-	})
-
-	// MM
-	bufStr := new(strings.Builder)
-	_, err = io.Copy(bufStr, &buf)
-	if err != nil {
-		return chaptersList, transList, isMtr, "", err
-	}
-
-	dataUH := regexp.MustCompile(`window.user_hash = '.+';`)
-	userHash = strings.Trim(dataUH.FindString(bufStr.String()), "window.user_hash = ';")
-
-	// RM
-	chaptersPage.Find("#translation > option").Each(func(i int, s *goquery.Selection) {
-		trID, _ := s.Attr("value")
-		trName := s.Text()
-
-		trans := data.RMTranslators{
-			ID:   trID,
-			Name: trName,
-		}
-
-		transList = append(transList, trans)
-	})
-
-	// MM
-	chaptersPage.Find(".translator-selection-item").Each(func(i int, s *goquery.Selection) {
-		trID, _ := s.Attr("id")
-		trID = strings.Trim(trID, "tr-")
-		trName := s.Find(".translator-selection-name").Text()
-
-		trans := data.RMTranslators{
-			ID:   trID,
-			Name: trName,
-		}
-
-		transList = append(transList, trans)
-	})
-
-	return tools.ReverseList(chaptersList), transList, isMtr, userHash, nil
-}
-
-func DownloadManga(downData data.DownloadOpts) error {
-	var err error
-	var chaptersList []data.ChaptersList
-	var saveChapters []string
-	savedFilesByVol := make(map[string][]string)
-
-	switch downData.Type {
-	case "all":
-		chaptersList, _, _, _, err = GetChaptersList(downData.MangaURL)
-		if err != nil {
-			slog.Error(
-				"Ошибка при получении списка глав",
-				slog.String("Message", err.Error()),
-			)
-			return err
-		}
-		time.Sleep(1 * time.Second)
-	case "chapters":
-		chaptersRaw := strings.Split(strings.Trim(downData.Chapters, "[] \""), "\",\"")
-		for _, ch := range chaptersRaw {
-			chapter := data.ChaptersList{
-				Path: ch,
-			}
-			chaptersList = append(chaptersList, chapter)
-		}
-	}
-
-	chaptersTotal := len(chaptersList)
-	chaptersCur := 0
-
-	data.WSChan <- data.WSData{
-		Cmd: "initProgress",
-		Payload: map[string]interface{}{
-			"valNow": 0,
-			"valMax": chaptersTotal,
-			"width":  0,
-		},
-	}
-
-	for _, chapter := range chaptersList {
-		volume := strings.Split(chapter.Path, "/")[0]
-
-		chSavedFiles, err := DownloadChapter(downData, chapter)
-		if err != nil {
-			if err.Error() == "noauth" {
-				data.WSChan <- data.WSData{
-					Cmd: "authErr",
-					Payload: map[string]interface{}{
-						"type": "err",
-						"text": "Для скачивания указанной манги необходимо авторизаваться на сайте!",
-					},
-				}
-
-				return nil
-			} else {
-				data.WSChan <- data.WSData{
-					Cmd: "updateLog",
-					Payload: map[string]interface{}{
-						"type": "err",
-						"text": "-- Ошибка при скачивании главы:" + err.Error(),
-					},
-				}
-			}
-		}
-
-		savedFilesByVol[volume] = append(savedFilesByVol[volume], chSavedFiles...)
-
-		chaptersCur++
-
-		saveChapters = append(saveChapters, chapter.Path)
-
-		time.Sleep(time.Duration(config.Cfg.Readmanga.TimeoutChapter) * time.Millisecond)
-
-		data.WSChan <- data.WSData{
-			Cmd: "updateProgress",
-			Payload: map[string]interface{}{
-				"valNow": chaptersCur,
-				"width":  tools.GetPercent(chaptersCur, chaptersTotal),
-			},
-		}
-	}
-
-	chapterPath := path.Join(config.Cfg.Savepath, downData.SavePath)
-
-	if downData.PDFvol == "1" {
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "std",
-				"text": "Создаю PDF для томов",
-			},
-		}
-
-		pdf.CreateVolPDF(chapterPath, savedFilesByVol, downData.Del)
-	}
-
-	if downData.PDFall == "1" {
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "std",
-				"text": "Создаю PDF для манги",
-			},
-		}
-
-		pdf.CreateMangaPdf(chapterPath, savedFilesByVol, downData.Del)
-	}
-
-	mangaID := tools.GetMD5(downData.MangaURL)
-	history.SaveHistory(mangaID, saveChapters)
-
-	data.WSChan <- data.WSData{
-		Cmd: "downloadComplete",
-		Payload: map[string]interface{}{
-			"text": "Скачивание завершено!",
-		},
-	}
-
-	return nil
-}
-
-func DownloadChapter(downData data.DownloadOpts, curChapter data.ChaptersList) ([]string, error) {
-	var err error
-
-	data.WSChan <- data.WSData{
-		Cmd: "updateLog",
-		Payload: map[string]interface{}{
-			"type": "std",
-			"text": "Скачиваю главу: " + curChapter.Path,
-		},
-	}
-
-	chapterURL := strings.TrimRight(downData.MangaURL, "/") + "/" + curChapter.Path
-
+func DownloadChapter(chapter data.ChaptersList, mangaTitle string) ([]string, error) {
 	var imageLinks []string
 
-	ptOpt := ""
-	mtrOpt := ""
-	uhOpt := ""
-
-	if downData.Mtr {
-		mtrOpt = "?mtr=1"
-	}
-
-	if downData.UserHash != "" {
-		if mtrOpt != "" {
-			uhOpt = "&"
-		} else {
-			uhOpt = "?"
-		}
-
-		uhOpt = uhOpt + "d=" + downData.UserHash
-	}
-
-	if downData.PrefTrans != "" {
-		if mtrOpt != "" || uhOpt != "" {
-			ptOpt = "&"
-		} else {
-			ptOpt = "?"
-		}
-
-		ptOpt = ptOpt + "tran=" + downData.PrefTrans
-	}
-
-	page, err := tools.GetPageCF(chapterURL + mtrOpt + uhOpt + ptOpt)
-	if err != nil {
-		slog.Error(
-			"Ошибка при получении страниц",
-			slog.String("Message", err.Error()),
-		)
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "err",
-				"text": "-- Ошибка при получении страниц:" + err.Error(),
-			},
-		}
-		return nil, err
-	}
-
-	pageBody, err := io.ReadAll(page)
-	if err != nil {
-		slog.Error(
-			"Ошибка при получении страниц",
-			slog.String("Message", err.Error()),
-		)
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "err",
-				"text": "-- Ошибка при получении страниц:" + err.Error(),
-			},
-		}
-		return nil, err
-	}
-
-	chapterPage, err := goquery.NewDocumentFromReader(bytes.NewReader(pageBody))
+	locURL, err := urlx.Parse(config.Cfg.Readmanga.MainURL)
 	if err != nil {
 		return nil, err
 	}
 
-	if chapterPage.Find(".auth-page .alert").Text() != "" {
-		return nil, errors.New("noauth")
+	pageBody, err := tools.GetPageCF(locURL.Scheme + "://" + locURL.Host + chapter.URL)
+	if err != nil {
+		return nil, err
 	}
 
-	r := regexp.MustCompile(`rm_h\.readerDoInit\(\[\[(.+)\]\],\s(false|true),\s(\[.+\]).+\);`)
+	// Ищем обновленный скрипт инициализации ридера (исправлено под новую верстку)
+	r := regexp.MustCompile(`rm_h\.initReader\(\s*\[\[(.+)\]\],\s*(false|true),\s*(\[.+\])`)
 
 	srvList := ServersList{}
 
 	chList := r.FindStringSubmatch(string(pageBody))
-
-	json.Unmarshal([]byte(chList[3]), &srvList)
+	if len(chList) < 4 {
+		// Запасной вариант на случай, если данные лежат в window.__MANGABOX_DATA__
+		rAlt := regexp.MustCompile(`window\.__MANGABOX_DATA__\s*=\s*\{\s*slides:\s*\[\[(.+)\]\],\s*servers:\s*(\[.+\])`)
+		chListAlt := rAlt.FindStringSubmatch(string(pageBody))
+		
+		if len(chListAlt) < 3 {
+			return nil, errors.New("не удалось найти данные глав на странице (структура сайта изменилась)")
+		}
+		
+		json.Unmarshal([]byte(chListAlt[2]), &srvList)
+		chList = []string{"", chListAlt[1], "", chListAlt[2]}
+	} else {
+		json.Unmarshal([]byte(chList[3]), &srvList)
+	}
 
 	imageParts := strings.Split(strings.Trim(chList[1], "[]"), "],[")
 
 	for i := 0; i < len(imageParts); i++ {
 		tmpParts := strings.Split(imageParts[i], ",")
-
-		imageLinks = append(imageLinks, strings.Trim(tmpParts[0], "\"'")+strings.Trim(tmpParts[2], "\"'"))
+		if len(tmpParts) < 3 {
+			continue
+		}
+		// Собираем ссылку: базовый путь + имя файла
+		imageLinks = append(imageLinks, strings.Trim(tmpParts[0], "\"' ")+strings.Trim(tmpParts[2], "\"' "))
 	}
 
-	chapterPath := path.Join(config.Cfg.Savepath, downData.SavePath, curChapter.Path)
+	chapterPath := tools.GetChapterPath(mangaTitle, chapter.Title)
 
 	if _, err := os.Stat(chapterPath); os.IsNotExist(err) {
-		os.MkdirAll(chapterPath, 0755)
+		err = os.MkdirAll(chapterPath, 0755)
+		if err != nil {
+			slog.Error("Ошибка при создании папки главы", slog.String("Message", err.Error()))
+			return nil, err
+		}
 	}
 
 	var savedFiles []string
 
 	for _, imgURL := range imageLinks {
-		fileName, err := DlImage(imgURL, chapterPath, srvList, 0)
-		if err != nil {
-			data.WSChan <- data.WSData{
-				Cmd: "updateLog",
-				Payload: map[string]interface{}{
-					"type": "err",
-					"text": "-- Ошибка при скачивании страницы (" + imgURL + "):" + err.Error(),
-				},
-			}
-			continue
+		var newImgUrl string
+
+		if strings.HasPrefix(imgURL, "/") {
+			refURL, _ := urlx.Parse(config.Cfg.Readmanga.MainURL)
+			newImgUrl = refURL.Scheme + "://" + refURL.Host + imgURL
+		} else {
+			newImgUrl = GetServer(imgURL, srvList)
 		}
 
-		savedFiles = append(savedFiles, fileName)
-
-		time.Sleep(time.Duration(config.Cfg.Readmanga.TimeoutImage) * time.Millisecond)
+		filename, err := DlImage(newImgUrl, chapterPath, srvList, 1)
+		if err == nil {
+			savedFiles = append(savedFiles, filename)
+		}
 	}
 
-	if downData.CBZ == "1" {
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "std",
-				"text": "- Создаю CBZ для главы",
-			},
-		}
-
-		tools.CreateCBZ(chapterPath)
-	}
-
-	if downData.PDFch == "1" {
-		data.WSChan <- data.WSData{
-			Cmd: "updateLog",
-			Payload: map[string]interface{}{
-				"type": "std",
-				"text": "- Создаю PDF для главы",
-			},
-		}
-
+	if config.Cfg.SavePDF {
 		pdf.CreatePDF(chapterPath, savedFiles)
 	}
 
-	if downData.PDFvol != "1" && downData.PDFall != "1" && downData.Del == "1" {
-		err := os.RemoveAll(chapterPath)
-		if err != nil {
-			slog.Error(
-				"Ошибка при удалении файлов",
-				slog.String("Message", err.Error()),
-			)
-		}
-	}
+	history.SaveHistory(chapter.URL)
 
-	return savedFiles, nil
+	return imageLinks, nil
+}
+
+func GetServer(imgURL string, srvList ServersList) string {
+	idx := rand.Intn(len(srvList))
+	return srvList[idx].Path + imgURL
 }
 
 func DlImage(imgURL, chapterPath string, srvList ServersList, retry int) (string, error) {
-	maxRetry := 5
-
-	if retry > 0 {
-		slog.Warn(
-			"Повторная попытка",
-			slog.Int("Message", retry),
-		)
-	}
+	maxRetry := 3
+	refURL, _ := urlx.Parse(config.Cfg.Readmanga.MainURL)
 
 	client := grab.NewClient()
-	client.UserAgent = config.Cfg.UserAgent
-
-	url, _ := urlx.Parse(imgURL)
-	host, _, _ := urlx.SplitHostPort(url)
-
-	if host == "one-way.work" {
-		imgURL = strings.Split(imgURL, "?")[0]
-	}
-
 	req, err := grab.NewRequest(chapterPath, imgURL)
 	if err != nil {
 		slog.Error(
-			"Ошибка при скачивании страницы",
+			"Ошибка при создании запроса для скачивания файла",
 			slog.String("Message", err.Error()),
 		)
 		if retry == maxRetry {
@@ -454,7 +173,7 @@ func DlImage(imgURL, chapterPath string, srvList ServersList, retry int) (string
 		}
 	}
 
-	// req.HTTPRequest.Header.Set("Referer", refURL.Scheme+"://"+refURL.Host+"/")
+	req.HTTPRequest.Header.Set("Referer", refURL.Scheme+"://"+refURL.Host+"/")
 
 	resp := client.Do(req)
 	if resp.Err() != nil {
@@ -485,24 +204,4 @@ func DlImage(imgURL, chapterPath string, srvList ServersList, retry int) (string
 	}
 
 	return resp.Filename, nil
-}
-
-func GetServer(imgURL string, srvList ServersList) string {
-	servers := []string{}
-
-	srcUrl, _ := urlx.Parse(imgURL)
-
-	for _, s := range srvList {
-		newUrl, _ := urlx.Parse(s.Path)
-
-		if newUrl.Host != srcUrl.Host {
-			servers = append(servers, newUrl.Host)
-		}
-	}
-
-	rnd := rand.Intn(len(servers) - 1)
-
-	srcUrl.Host = servers[rnd]
-
-	return srcUrl.String()
 }
